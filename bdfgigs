@@ -1,0 +1,490 @@
+#!/usr/bin/sh
+# Bill Hassell Apr 2007
+
+#      ######  ######  ####### #     # #######  #####   #####
+#      #     # #     # #       ##   ## #       #     # #     #
+#      #     # #     # #       # # # # #       #       #
+#      ######  #     # #####   #  #  # #####   #  ####  #####
+#      #     # #     # #       #     # #       #     #       #
+#      #     # #     # #       #     # #       #     # #     #
+#      ######  ######  #       #     # #######  #####   #####
+#
+
+VERSION=4.5
+# Ver 4.5 - Replaced cat $BDFLIST | while read... with stdin redirect
+#           Replaced awk & grep pipes with awk only
+# Ver 4.4 - Added version numnber to Usage. Added -u option which
+#           returns Usage on stdout and zero return code. Otherwise,
+#           Usage goes to stderr and return code = 1.
+#           Extended sum line to match the source column
+# Ver 4.3 - Added -P ## to show only filesystems over percentage
+#           Added bdf error messages to end of list
+#           -q also turns off enhancements for script/batch usage
+#           Added -s for summation of displayed filesystem space
+#           Added autofs and DevFS to filesystem support
+#           Add diagnostic msg for unmounted sources
+#           Fixed cifs problems with \\names from Windows
+# Ver 4.2 - Added highlights to error messages. Added -p ##
+#           to show percent usage higher than ##. Default to
+#           gigabytes (-g) if script is called bdfgigs
+# Ver 4.1 - Added -t to match bdf.
+# Ver 4.0 - Handle errors when looking at source devices w/out
+#           a filesystem or unmounted such as swap and raw devices.
+# Ver 3.9 - Added -s for sums (total, used, avail)
+# Ver 3.8 - Cleaned up help text with a Usage function.
+#           Added -q to suppress the header line for data collection
+# Ver 3.7 - Added vxfs filesystem version to -v. Requires read
+#           permission on character dev file
+# Ver 3.6 - Changed to add -g for gigabytes
+#           Added dir(s) or file(s) to match bdf options
+#           Removed blk/frg and vxfs version and obtain
+#             largefiles flag from df -g so anyone can use -v
+# Ver 3.5 - Changed to use getopts for options
+# Ver 3.4 - Changed to ignore autofs entries in mount -p
+# Ver 3.3 - Changed formats to handle terabyte lvols
+# Ver 3.2 - Simplify code with local $PATH
+# Ver 3.1 - Trap fsadm errors and change return code.  Allow -vl
+#             or -lv combinations.
+# Ver 3.0 - Rewrote using temp files to speed up code about 10:1
+#           Added -l option and ? or -? help
+# Ver 2.1 - Added vxfs filesystem layout verrsion (2,3,4,etc)
+#           Added non-root check for -v option fsadm needs root
+#             permission for fsadm to read lvols directly.
+# Ver 2.0 - Change Blks to blk/frag size and add largefile status
+#           Made: FSTYPE blk/frag and largefile optional with -v
+#             to reduce the width of the line
+# Ver 1.2 - Expanded filesystem type to handle autofs
+# Ver 1.1 - Added blocksize column for filesystem blocks
+# Ver 1.0 - Original
+# -----------------------------------------------------------------------
+
+# Show bdf in megs or gigs for easy reading
+#
+# Usage:  bdfmegs [ -vlg [ file(s) or dir(s) ]
+#   -g = show gigabytes, otherwise megabytes
+#   -l = local (no NFS)
+#   -p ## = highlight % -ge ##
+#   -P ## = show only % -ge ##
+#   -q = suppress header line and no char enhancements
+#   -s = summarize total, used and available
+#   -t = filesystem (one only such as hfs cdfs nfs vxfs cifs etc)
+#   -u = usage (return code=0, Usage to stdout)
+#   -v = verbose
+
+# After the options, path(s) or file(s) may be added to limit
+#   the filesystems to be listed.
+
+# PERFORMANCE NOTE:
+#   bdf has historically performed a filesystem sync as it looks
+#       at every mountpoint. This can be very costly in time and
+#       disk I/O on a busy system. If gdf has been installed, it
+#       will use gdf in place of bdf.
+
+# The width of the source filesystem will be adjusted to the
+# longest path (ie, NFS or other long device filename).  All
+# fields are in megs (defined as Kbytes/1024) or gigs.  Field
+# widths for sizes are 7 digits for multi-terabyte capability.
+
+set -u
+PATH=/usr/bin:/usr/sbin
+TRACEME=${TRACEME:-false}               # TRACEME non-null = trace on
+[ $TRACEME != false ]  && set -x && PS4='[$LINENO]: '
+
+MYNAME=${0##*/}
+HPUXVER=$(uname -r | cut -d. -f2-3 | tr -d .)
+if [ "$MYNAME" = "bdfgigs" ]
+then
+   let MAGNITUDE=1048576                # 1024*1024
+   GIGABYTES=true
+else
+   MAGNITUDE=1024
+   GIGABYTES=false
+fi
+
+TEMPDIR=/var/tmp/$MYNAME.$$             # tempfile setup and cleanup
+mkdir $TEMPDIR
+chmod 700 $TEMPDIR
+BDFLIST=$TEMPDIR/bdflist
+ERRLIST=$TEMPDIR/bdflist.error
+trap "rm -rf $TEMPDIR;exit" 0 1 2 3 15
+
+# speedup df for 11.23 and up
+[ $HPUXVER -ge 1123 ] && FASTDF="-s" || FASTDF=""
+
+# Initial values
+
+typeset -R7  MTOT
+typeset -R7  MUSED
+typeset -R7  MAVAIL
+typeset -R5  PERCENT
+typeset -R6  FSTYPE
+typeset -R2  FSVER
+typeset -i   SUMTOT=0
+typeset -i   SUMUSED=0
+typeset -i   SUMAVAIL=0
+typeset -R7  FSUMTOT=0
+typeset -R7  FSUMUSED=0
+typeset -R7  FSUMAVAIL=0
+
+# filesystems
+
+set -A FSID hfs vxfs nfs cdfs cifs autofs DevFS  # filesystem types allowed
+FSQTY=${#FSID}                  # qty of known filesystems
+FSONLY=""                       # used if -t <fs-type> specified
+NODEVREAD=false                 # flag in case -v can't read devfile ver
+PCTLIMIT=0                      # 0=no highlight
+PCTLIMITONLY=false              # true=suppress lines under pct limit
+
+# terminal enhancements - error messages and -p option
+# set char enhancments only if interactive
+
+if tty -s
+then
+  export HB=$(tput dim)          # dim text
+  export HV=$(tput smso)         # 1/2 bright inverse
+  export IV=$(tput bold)         # inverse
+  export UL=$(tput smul)         # underline
+  export BL=$(tput blink)        # blink
+  export EE=$(tput sgr0)         # end all enhancements
+else
+  HB="" HB="" IV="" UL="" BL="" EE=""
+fi
+
+
+# F U N C T I O N S
+#################################################
+function Usage
+{
+
+# Usage "error message"
+# If "error message" is null, send output to stdout and return code = 0
+#  Otherwise, send Usage to stderr and set return code to 1.
+
+  [ $TRACEME != false ]  && set -x && PS4='[$LINENO]: '
+
+  [ $# -gt 0 ] && print -u2 "$@"
+
+  TEXT="
+
+  Usage: $MYNAME [ -glPpqstvu ] [ dir(s) or file(s) ]
+    where:
+         -g = gigabytes rather than megabytes
+         -l = local only (not NFS)
+         -p ## = highlight pct -ge ##
+         -P ## = same as -p but show only pct -ge ##
+         -q = suppress the header line and no char enhancements
+         -s = summary of total, used and available
+         -t xxxx = specifc filesystem $IV(${FSID[@]})$EE
+         -u = usage details (return code = 0, usage text to stdout)
+         -v = verbose (shows FSversion, largefiles flag)
+              (requires read permission for mountpoint)
+
+  File(s) or dirpath(s) may be specified to limit
+  the output of $MYNAME as in:
+
+     $MYNAME -vlg /usr/contrib/bin /var/tmp
+
+  If $MYNAME is run as bdfgigs (ie, a link), then -g is default.
+($MYNAME ver $VERSION)
+"
+  if [ $# -eq 0 ]
+  then
+    print -u1 "$TEXT"           # stdout
+  else
+    print -u2 "$TEXT"           # stderr
+    exit 1
+  fi
+  exit 0
+}
+
+# Construct a multiple -e list of filesystem types based on
+#    the size of the FSID array. EOPT=" -e hfs -e nfs -e vxfs"ID
+
+EOPT=""
+for MYFS in ${FSID[@]}
+do
+   EOPT="$EOPT -e $MYFS"
+done
+
+# Process all options
+
+SUMS="false"
+NOSYNC=""
+VERBOSE="false"
+LOCALFS=""
+NOHEADER="false"
+
+while getopts ":lgqip:P:st:uv" OPTCHAR
+do
+  case $OPTCHAR in
+       v) VERBOSE=true ;;
+       l) LOCALFS="-l" ;;
+       q) NOHEADER="true"       # also turn off header and char enhancements
+          HB="" HB="" IV="" UL="" BL="" EE=""
+          ;;
+       g) let MAGNITUDE=$MAGNITUDE*1024
+          GIGABYTES=true
+          ;;
+       s) SUMS="true" ;;
+       t) FSONLY="$OPTARG"              # validate filesystem type
+          if [ $(echo "$FSONLY" | grep -c $EOPT) -eq 0 ]
+          then
+             echo "\n${IV}Invalid -t option: $EE$BL$FSONLY$EE"
+             Usage "  ${IV}- must be one (only) of: ${FSID[@]} $EE"
+          else
+             FSONLY="-t $FSONLY"
+          fi
+          ;;
+   P | p) PCTLIMIT="$OPTARG"            # highlight percent limit
+          [ ! -z "$(echo $PCTLIMIT | tr -d '[:digit:]')" ] \
+            && Usage "\n${BL}-p $PCTLIMIT$EE$IV not a number 1-100$EE"
+          [ $PCTLIMIT -gt 100 -o $PCTLIMIT -lt 1 ] \
+            && Usage "${BL}-p $PCTLIMIT$EE$IV not in range 1-100$EE"
+          [ $OPTCHAR = P ] && PCTLIMITONLY=true
+          ;;
+       u) Usage ;;
+       *) Usage "\n${IV}Invalid option(s) $EE$BL$@ $EE"
+          ;;
+  esac
+done
+shift $(($OPTIND -1))
+
+# Optional files or directories following options
+
+[ $# -gt 0 ] && SPECIFY="$@" || SPECIFY=""
+
+
+#####################################
+# Get a list of mountpoints
+# For bdf, process the list and paste the 2-line data together
+#    into a file to speed things up
+#
+# The mechanism is to read all the params from each line.  If the
+#    line has been split, only the source is on line 1 so the rest
+#    of the params are null when read, so if $TOT is blank, read
+#    the next line for the missing params.
+
+# Skip the header line
+
+# Use gdf rather than bdf when available
+#   gdf does not try to sync which is much faster (but less up to date)
+#   Look for G_df as well as gdf, choose file > 800k
+
+if [ -x /usr/local/bin/gdf ]
+then
+   [ $(cat /usr/local/bin/gdf | wc -c) -gt 500000 ] \
+      && alias bdf="/usr/local/bin/gdf -k"
+   if [ -x /usr/local/bin/G_df ]
+   then
+      [ $(cat /usr/local/bin/G_df | wc -c) -gt 500000 ] \
+         && alias bdf="/usr/local/bin/G_df -k"
+   fi
+fi
+
+# Run bdf into a file
+# Get error messages into a separate file for later
+
+bdf $LOCALFS $FSONLY $SPECIFY 2>$ERRLIST | \
+  while read FS TOT USED AVAIL PERCENT MNT
+  do
+    if [ $FS != "Filesystem" ]
+    then
+       if [ "$TOT" = "" ]
+       then
+         read TOT USED AVAIL PERCENT MNT
+       fi
+       echo  $FS $TOT $USED $AVAIL $PERCENT $MNT
+    fi
+  done > $BDFLIST
+
+# Find the longest source string with a sweep through $BDFLIST
+# Minimum length is 12 so typeset will pad on the right when
+# needed.
+
+
+MAXLEN=12
+while read SOURCE DUMMY
+do
+   [ ${#SOURCE} -gt $MAXLEN ] && MAXLEN=${#SOURCE}
+done < $BDFLIST
+
+# Variable width typesets here
+#
+#  By using eval, a variable typeset instruction can be created
+#  and then executed as part of the inline script.
+
+#  First is for the filesystem source string
+#  Second is to pad the title. Note that PAD must be typeset to
+#  a value greater than 0, so subtract 11 for the evaluation.
+#  (the minimum width for a source directory is 12 chars)
+
+eval "typeset -L$MAXLEN FS"
+eval "typeset -L$(( MAXLEN - 11 )) PAD=' '"
+
+# Print the title line. $PAD is used to prorvide proper spacing for
+#   short to long source filesystem names.  This must match the
+#   evaluated typeset value for $FS above.  We'll split the line
+#   at %Used in order to have plain and verbose versions.
+
+[ $GIGABYTES = "true" ] && BYTES=Gbytes || BYTES=Mbytes
+[ $NOHEADER = "true" ] || \
+    echo "File-System $PAD $BYTES    Used   Avail %Used \c"
+
+if [ $NOHEADER = "false" ]
+then
+   if $VERBOSE
+   then
+      echo "  Type Vr Lrg Mounted on"
+   else
+      echo "Mounted on"
+   fi
+fi
+
+###################################################################
+# Walk through each mountpoint gathering info
+# To track down the filesystem type, use mount -p in a
+#   variable so it can be searched faster in memory
+
+MOUNTP=$(mount -p)
+
+while read FS TOT USED AVAIL PERCENT MNT
+do
+
+#  Compute megs or gigs with $MAGNITUDE (1024 or 1024*1024)
+
+  MTOT=$(echo $TOT  \
+         | awk '{print int($1/'$MAGNITUDE'+.5)}')
+  MUSED=$(echo $USED  \
+         | awk '{print int($1/'$MAGNITUDE'+.5)}')
+  MAVAIL=$(echo $AVAIL  \
+         | awk '{print int($1/'$MAGNITUDE'+.5)}')
+
+  # Setup for highlighting pct limit fields
+
+  I=""
+  E=""
+  if [ $PCTLIMIT -gt 0 ]
+  then
+     PCT=$(echo $PERCENT | tr -d %)
+     if [ $PCT -ge $PCTLIMIT ]
+     then
+        I=$IV
+        E=$EE
+     fi
+# show only over pct lines?
+
+     [ $PCT -lt $PCTLIMIT -a $PCTLIMITONLY = "true" ] && continue
+  fi
+
+
+  if [ $SUMS = "true" ]
+  then
+     let SUMTOT=$SUMTOT+$(echo $TOT \
+         | awk '{print int($1/'$MAGNITUDE'+.5)}')
+     let SUMUSED=$SUMUSED+$(echo $USED \
+         | awk '{print int($1/'$MAGNITUDE'+.5)}')
+     let SUMAVAIL=$SUMAVAIL+$(echo $AVAIL \
+         | awk '{print int($1/'$MAGNITUDE'+.5)}')
+  fi
+
+  if [ "$MNT" != "" ]                                   # skip unmounted
+  then
+    echo "$FS $MTOT $MUSED $MAVAIL $I$PERCENT$E \c"     # show data
+    if $VERBOSE
+    then
+
+# VxFS filesystem version is found with fstyp but requires the source
+#    device file be readable by current user. Otherwise, print na and
+#    add a note.  Also, handle raw devices such as swap and raw
+#    database volumes in case bdf returns something for them.
+
+# Find VxFS version - use mount -p to ID the filesystem type
+# NOTE: search by mountpoint as cifs may have \\ names from WindowsJunk
+
+       FSTYPE=$(echo "${MOUNTP}" \
+              | awk -v MNT=${MNT} '{if ($2==MNT) {print $3}}')
+       if [ "$FSTYPE" = "  vxfs" ]
+       then
+          if [ -r $FS ]                 # can we read the source devicefile?
+          then
+             FSVER=$(fstyp -v $FS | awk '/version:/ {print $2}')
+          else
+             FSVER="na"
+             NODEVREAD=true
+          fi
+       else
+          FSVER="-"
+       fi
+
+# SLOW CODE warning: df is invasive to get the right data
+#      so bdfmegs -v will be slow.
+
+# filesystem features (from /usr/include/sys/statvfs.h)
+# df -g will return these flags
+
+#       ST_RDONLY      0x01    /* read only vfs */
+#       ST_NOSUID      0x02    /* someone is waiting for lock */
+#       ST_EXPORTED    0x04    /* file system is exported (NFS) */
+#       ST_QUOTA       0x08    /* filesystem with quotas */
+#       ST_LARGEFILES  0x10    /* filesystem supports largefiles */
+#
+# For now, just test that the features flag is greater
+#   than 0x10 or 16. Use bc to convert the flag into
+#   a decimal number. printf has a problem with %.0f
+#   prior to 11.23) bc requires uppercase chars so
+#   use typeset -u
+
+
+       typeset -u HEX
+       HEX=$(df -g $FASTDF $MNT \
+            | tr -d x | awk '/ flags / {print $1}')
+       DECFLG=$(echo "ibase=16\n $HEX" | bc)
+       [ $DECFLG -ge 16 ] && LG="yes" || LG=" no"
+
+       echo "$FSTYPE $FSVER $LG $MNT"
+    else
+       echo "$MNT"
+    fi
+  else
+
+# this source is not mounted
+
+    echo "$FS is not mounted or has no filesystem" >> $ERRLIST
+  fi
+done < $BDFLIST
+
+# Summary of displayed lvol sizes
+
+# BYTES=Mbytes or Gbytes
+#   echo "File-System $PAD $BYTES    Used   Avail %Used \c"
+
+if [ $SUMS = "true" ]
+then
+   FSUMTOT=$SUMTOT
+   FSUMUSED=$SUMUSED
+   FSUMAVAIL=$SUMAVAIL
+   eval "typeset -L$MAXLEN DASHES"
+   DASHES="-- sum totals ------------------------------------------------"
+   echo "$DASHES $FSUMTOT $FSUMUSED $FSUMAVAIL   --- sum totals ---"
+
+fi
+
+
+# In case -v was specified and one or more device files were not
+#   readable by the current user, add a note
+
+if $NODEVREAD
+then
+  echo "\n   ${IV}Note:${EE} ${BL}na$EE ${IV}means devicefile not readable by user $(id -un)$EE"
+fi
+
+if [ -s $ERRLIST ]
+then
+   echo
+   echo "Error messages:"
+   cat $ERRLIST | while read
+   do
+      echo "   ${IV}$REPLY$EE"
+   done
+fi
+echo
